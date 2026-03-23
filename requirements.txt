@@ -1,0 +1,38 @@
+# Nemotron Embedding Extraction Pipeline
+# Install: pip install -r requirements.txt
+# Note: torch must be installed separately with CUDA support:
+#   pip install torch==2.10.0+cu130 torchvision==0.25.0+cu130 --index-url https://download.pytorch.org/whl/cu130
+
+
+# Core ML (transformers version must match nemo-curator 1.1.0)
+transformers==4.55.2
+accelerate==1.12.0
+sentencepiece==0.2.1
+einops==0.8.2
+huggingface-hub==0.36.2
+
+# Data processing (numpy<2.3 required by numba/cudf stack; >=1.26 for pandas on py3.12)
+numpy>=1.26,<2.3
+pandas==2.3.3
+pyarrow==23.0.0
+omegaconf
+
+# Distributed / multi-GPU
+ray==2.53.0
+
+# NeMo Curator pipeline (used by 02_embedding_extraction_nemocurator.py)
+nemo-curator==1.1.0
+loguru==0.7.3
+# Extractor
+justext
+resiliparse
+trafilatura
+pycld2
+bs4
+warcio   # required by nemo_curator.stages.text.download (CommonCrawl iterator)
+nvidia-ml-py  # required by Ray/cosmos-xenna for GPU detection (replaces deprecated pynvml)
+
+# Embedding reduction / visualization (04_embedding_reduction_nemocurator.py)
+scikit-learn
+umap-learn
+tqdm

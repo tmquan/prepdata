@@ -1,0 +1,87 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Centralised configuration for all NeMo Curator pipeline scripts.
+#
+# Imported by:
+#   00_datasets_downloader.py
+#   01_datasets_explorer.py
+#   02_embedding_extractor.py
+#   04_embedding_reduction.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── Paths ───────────────────────────────────────────────────────────────────
+datasets_dir:   /raid/datasets
+embeddings_dir: /raid/embeddings_curator
+
+# ─── Model ───────────────────────────────────────────────────────────────────
+model_id:      nvidia/llama-embed-nemotron-8b
+embedding_dim: 4096
+
+# ─── Pipeline ────────────────────────────────────────────────────────────────
+batch_size:          8      # model inference batch size (must fit GPU VRAM)
+num_gpus:            8
+max_seq_length:      32768
+chunk_size:          10000  # records per output parquet partition
+files_per_partition: 1      # NeMo Curator ParquetReader setting
+chars_per_token:     4      # rough estimate for truncation heuristics
+
+# ─── Datasets ────────────────────────────────────────────────────────────────
+# Fields
+#   hf_name         – HuggingFace repo id (org/repo)
+#   category        – "pretraining" | "post-training"
+#   format          – "parquet" | "jsonl"
+#   hf_configs      – HF dataset config names to download (multiple → joined on join_key)
+#   join_key        – column used to join configs; null if single config
+#   text_field      – source column renamed to "text" in the final output
+#   metadata_fields – additional columns kept alongside "text"
+#   text_strategy   – documents how the text field is constructed
+
+datasets:
+
+  # ── Vietnamese legal documents ──────────────────────────────────────────────
+  # https://huggingface.co/datasets/th1nhng0/vietnamese-legal-documents
+  # 518,255 documents | ~3.6 GB parquet | 1924–2026
+  # Two HF configs joined on 'id':
+  #   metadata – 9 columns, ~82 MB  (document number, title, legal_type, …)
+  #   content  – 2 columns, ~3.6 GB (id, full markdown document text)
+  vietnamese-legal-documents:
+    hf_name:  th1nhng0/vietnamese-legal-documents
+    category: pretraining
+    format:   parquet
+    hf_configs:
+      - metadata
+      - content
+    join_key:   id
+    text_field: content
+    metadata_fields:
+      - document_number
+      - title
+      - url
+      - legal_type
+      - legal_sectors
+      - issuing_authority
+      - issuance_date
+      - signers
+    text_strategy:
+      fields:   [content]
+      template: raw_text
+      description: >
+        Each record is a single Vietnamese legal document (law, decree,
+        circular, decision, etc.) stored as cleaned Markdown text.
+      preprocessing: >
+        Strip whitespace. Lengths range from ~400 to ~2,200,000 characters;
+        truncate to max_seq_length * chars_per_token before embedding.
+
+  # ── Add further datasets here ───────────────────────────────────────────────
+  # my-dataset:
+  #   hf_name:  org/repo-name
+  #   category: pretraining
+  #   format:   parquet
+  #   hf_configs: [default]
+  #   join_key:   ~
+  #   text_field: text
+  #   metadata_fields: []
+  #   text_strategy:
+  #     fields:   [text]
+  #     template: raw_text
+  #     description: ""
+  #     preprocessing: ""
