@@ -3,14 +3,23 @@
 #
 # Imported by:
 #   00_datasets_downloader.py
-#   01_datasets_explorer.py
 #   02_embedding_extractor.py
-#   04_embedding_reduction.py
+#   04_embedding_reducer.py
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
-datasets_dir:   /raid/datasets
-embeddings_dir: /raid/embeddings_curator
+pipeline_data_dir: /raid/datasets
+
+# Subdirectory names under <pipeline_data_dir>/<dataset_key>/ (override if needed).
+curator_layout:
+  raw: raw
+  preprocessed: preprocessed
+  embeddings: embeddings
+  reductions: reductions
+
+# Migrating older trees:
+#   <dataset>/data/           → <dataset>/preprocessed/
+#   <embeddings_dir>/<dataset>/parquet  → <dataset>/embeddings/
 
 # ─── Model ───────────────────────────────────────────────────────────────────
 model_id:      nvidia/llama-embed-nemotron-8b

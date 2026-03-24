@@ -20,7 +20,7 @@ omegaconf
 # Distributed / multi-GPU
 ray==2.53.0
 
-# NeMo Curator pipeline (used by 02_embedding_extraction_nemocurator.py)
+# NeMo Curator pipeline (02_embedding_extractor.py, 04_embedding_reducer.py)
 nemo-curator==1.1.0
 loguru==0.7.3
 # Extractor
@@ -32,7 +32,14 @@ bs4
 warcio   # required by nemo_curator.stages.text.download (CommonCrawl iterator)
 nvidia-ml-py  # required by Ray/cosmos-xenna for GPU detection (replaces deprecated pynvml)
 
-# Embedding reduction / visualization (04_embedding_reduction_nemocurator.py)
+# Embedding reduction / visualization (04_embedding_reducer.py)
 scikit-learn
 umap-learn
 tqdm
+
+# RAPIDS CUDA 13 — GPU path for 04_embedding_reducer.py (cuML t-SNE / UMAP).
+# Driver >= 580.65 recommended. Wheels live on NVIDIA PyPI; may pin different
+# nvidia-* / cuda-bindings versions than torch+cu130 — verify NeMo/torch if both are needed.
+--extra-index-url https://pypi.nvidia.com
+cudf-cu13==26.2.1
+cuml-cu13==26.2.0
