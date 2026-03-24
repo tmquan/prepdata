@@ -10,7 +10,10 @@ Input
 
 Output
 ------
-<pipeline_data_dir>/<dataset>/embedding/
+If ``embeddings_curator_dir`` is set in config.yaml:
+    <embeddings_curator_dir>/<dataset>/part-*.parquet
+else:
+    <pipeline_data_dir>/<dataset>/<embedding>/
     part-*.parquet  — embeddings column (float32 list, length = embedding_dim)
     metadata.json
 
@@ -18,10 +21,20 @@ Resume-safe: skips datasets whose embedding/ already contains parquet shards.
 
 Usage
 -----
-    python 02_embedding_extractor.py
+    python 02_embedding_extractor.py --list
+    python 02_embedding_extractor.py --list --list_format tsv
+    python 02_embedding_extractor.py --datasets vietnamese-legal-documents
+    python 02_embedding_extractor.py --datasets @selected.txt
     python 02_embedding_extractor.py --dataset vietnamese-legal-documents
     python 02_embedding_extractor.py --file_limit 3
     python 02_embedding_extractor.py --dry_run
+
+``--list`` scans ``pipeline_data_dir`` (datasets root) and ``config.yaml`` together:
+every name that appears as a top-level directory **or** as a ``datasets:`` key, with
+status ``ready`` / ``missing_preprocessed`` / ``disk_only_ready``.
+
+Embedding runs on any folder that has preprocessed shards (including disk-only names
+not listed in config). ``--datasets`` uses exact directory/config keys (see ``--list``).
 """
 
 from __future__ import annotations
@@ -56,21 +69,190 @@ def _preprocessed_dir(pipeline_root: str | Path, dataset_key: str) -> Path:
     return Path(pipeline_root) / dataset_key / _layout_subdir("preprocessed", "preprocessed")
 
 
-def _embedding_dir(pipeline_root: str | Path, dataset_key: str) -> Path:
+def _resolved_embeddings_curator_root(cli_override: str | None) -> Path | None:
+    """Central embedding parquet root: CLI wins, else ``config.yaml`` ``embeddings_curator_dir``."""
+    if cli_override is not None and str(cli_override).strip():
+        return Path(str(cli_override).strip())
+    raw = OmegaConf.select(_CFG, "embeddings_curator_dir")
+    if raw is not None and str(raw).strip():
+        return Path(str(raw).strip())
+    return None
+
+
+def _embedding_dir(
+    pipeline_root: str | Path,
+    dataset_key: str,
+    embeddings_curator_root: Path | None,
+) -> Path:
+    if embeddings_curator_root is not None:
+        return embeddings_curator_root / dataset_key
     return Path(pipeline_root) / dataset_key / _layout_subdir("embedding", "embedding")
 
 
 def _list_parquet_shards(shard_dir: Path) -> list[Path]:
-    part = sorted(
-        p for p in shard_dir.glob("part-*.parquet")
-        if p.is_file() and not p.name.startswith(".")
-    )
-    if part:
-        return part
+    """``part-*.parquet`` and ``part_*_of_*.parquet`` (underscore style)."""
+    seen: set[str] = set()
+    out: list[Path] = []
+    for pattern in ("part-*.parquet", "part_*_of_*.parquet"):
+        for p in shard_dir.glob(pattern):
+            if not p.is_file() or p.name.startswith(".") or p.name in seen:
+                continue
+            seen.add(p.name)
+            out.append(p)
+    if out:
+        return sorted(out, key=lambda x: x.name)
     return sorted(
         p for p in shard_dir.glob("*.parquet")
         if p.is_file() and not p.name.startswith(".")
     )
+
+
+def _dataset_filter_matches(filter_s: str | None, key: str) -> bool:
+    if filter_s is None:
+        return True
+    return key == filter_s or key.startswith(filter_s + "/")
+
+
+def _parse_datasets_keys(values: list[str] | None) -> set[str] | None:
+    if not values:
+        return None
+    keys: set[str] = set()
+    for raw in values:
+        s = raw.strip()
+        if not s:
+            continue
+        if s.startswith("@") and len(s) > 1:
+            path = Path(s[1:]).expanduser()
+            if not path.is_file():
+                raise SystemExit(f"--datasets: file not found: {path}")
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    keys.add(line)
+        else:
+            keys.add(s)
+    return keys if keys else None
+
+
+def _top_level_dir_names(pipeline_root: Path) -> list[str]:
+    """Names of immediate subdirectories under ``pipeline_data_dir`` (datasets on disk)."""
+    if not pipeline_root.is_dir():
+        return []
+    return sorted(
+        p.name
+        for p in pipeline_root.iterdir()
+        if p.is_dir() and not p.name.startswith(".")
+    )
+
+
+def _all_dataset_keys(pipeline_root: Path) -> list[str]:
+    """Union of ``config.datasets`` keys and top-level names under ``pipeline_data_dir``."""
+    names = set(_CFG.datasets.keys()) | set(_top_level_dir_names(pipeline_root))
+    return sorted(names)
+
+
+def _describe_dataset(
+    key: str,
+    pipeline_root: Path,
+    embeddings_curator_root: Path | None,
+) -> dict:
+    """One row: preprocessed shards, output path, config membership, coarse status."""
+    in_config = key in _CFG.datasets
+    hf_name = ""
+    if in_config:
+        hf = _CFG.datasets[key].get("hf_name", "")
+        hf_name = str(hf) if hf is not None else ""
+
+    pre = _preprocessed_dir(pipeline_root, key)
+    inputs = _list_parquet_shards(pre) if pre.is_dir() else []
+    rows = (
+        sum(pq.ParquetFile(str(f)).metadata.num_rows for f in inputs) if inputs else 0
+    )
+    out = _embedding_dir(pipeline_root, key, embeddings_curator_root)
+
+    if inputs:
+        status = "ready" if in_config else "disk_only_ready"
+    else:
+        status = "missing_preprocessed"
+
+    return {
+        "key": key,
+        "in_config": in_config,
+        "status": status,
+        "input_files": inputs,
+        "total_rows": rows,
+        "preprocessed_dir": pre,
+        "output_dir": out,
+        "hf_name": hf_name,
+    }
+
+
+def _list_datasets_dir_snapshot(
+    pipeline_root: Path,
+    embeddings_curator_root: Path | None,
+    dataset_filter: str | None,
+) -> list[dict]:
+    """All known dataset keys (config ∪ disk) with preprocessed / status."""
+    rows: list[dict] = []
+    for key in _all_dataset_keys(pipeline_root):
+        if not _dataset_filter_matches(dataset_filter, key):
+            continue
+        rows.append(_describe_dataset(key, pipeline_root, embeddings_curator_root))
+    return rows
+
+
+def _collect_embedding_candidates(
+    pipeline_root: str | Path,
+    embeddings_curator_root: Path | None,
+    dataset_filter: str | None,
+) -> list[dict]:
+    """Datasets with preprocessed parquet (config and/or disk-only under ``pipeline_data_dir``)."""
+    root = Path(pipeline_root)
+    items: list[dict] = []
+    for row in _list_datasets_dir_snapshot(root, embeddings_curator_root, dataset_filter):
+        if not row["input_files"]:
+            continue
+        items.append(
+            {
+                "key": row["key"],
+                "input_files": row["input_files"],
+                "output_dir": row["output_dir"],
+                "total_rows": row["total_rows"],
+                "preprocessed_dir": row["preprocessed_dir"],
+                "hf_name": row["hf_name"],
+                "in_config": row["in_config"],
+                "status": row["status"],
+            }
+        )
+    return items
+
+
+def _apply_datasets_key_filter(
+    candidates: list[dict], wanted: set[str], pipeline_root: Path
+) -> list[dict]:
+    have = {c["key"] for c in candidates}
+    missing = wanted - have
+    if missing:
+        for m in sorted(missing):
+            ds_dir = pipeline_root / m
+            pre = _preprocessed_dir(pipeline_root, m)
+            if not ds_dir.is_dir():
+                logger.error(
+                    "No dataset directory '{}' under {} (see --list)",
+                    m,
+                    pipeline_root,
+                )
+            elif not pre.is_dir() or not _list_parquet_shards(pre):
+                logger.error(
+                    "No preprocessed parquet for '{}' under {} — run 00_datasets_downloader.py",
+                    m,
+                    pre,
+                )
+            else:
+                logger.error("Dataset '{}' could not be selected — run with --list", m)
+        logger.info("Run with --list to see datasets under pipeline_data_dir and config.")
+        return []
+    return [c for c in candidates if c["key"] in wanted]
 
 
 def _canonicalize_parquet_shards(directory: Path) -> int:
@@ -226,12 +408,57 @@ def _run_dataset(
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="NeMo Curator embedding extraction")
-    p.add_argument("--dataset", default=None, help="config.datasets key (default: all)")
+    p = argparse.ArgumentParser(
+        description="NeMo Curator embedding extraction",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  %(prog)s --list\n"
+            "  %(prog)s --list --list_format tsv > ready.tsv\n"
+            "  %(prog)s --datasets vietnamese-legal-documents\n"
+            "  %(prog)s --datasets @selected.txt --dry_run\n"
+        ),
+    )
+    p.add_argument(
+        "--list",
+        action="store_true",
+        help=(
+            "List dataset names from pipeline_data_dir ∪ config.yaml with status "
+            "(ready / missing_preprocessed / disk_only_ready) and exit"
+        ),
+    )
+    p.add_argument(
+        "--list_format",
+        choices=("plain", "tsv", "json"),
+        default="plain",
+        help="Output style for --list (default: plain)",
+    )
+    p.add_argument(
+        "--dataset",
+        default=None,
+        metavar="PREFIX",
+        help="Only datasets whose key equals PREFIX or starts with PREFIX/ (single filter)",
+    )
+    p.add_argument(
+        "--datasets",
+        nargs="*",
+        metavar="KEY",
+        default=None,
+        help=(
+            "Exact dataset name(s): must match a top-level dir under pipeline_data_dir "
+            "(space-separated). Use @path for a key file (one per line, # ok). "
+            "Do not combine with --dataset."
+        ),
+    )
     p.add_argument(
         "--pipeline_data_dir",
         default=_CFG.pipeline_data_dir,
-        help="Root with <dataset>/preprocessed and <dataset>/embedding",
+        help="Root with <dataset>/preprocessed; embeddings go to embeddings_curator_dir if set",
+    )
+    p.add_argument(
+        "--embeddings_curator_dir",
+        default=None,
+        help="Override config.yaml embeddings_curator_dir for output parquet root",
     )
     p.add_argument("--num_gpus", type=int, default=_CFG.num_gpus)
     p.add_argument("--batch_size", type=int, default=_CFG.batch_size)
@@ -244,32 +471,102 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    keys = [args.dataset] if args.dataset else list(_CFG.datasets.keys())
+
+    if args.dataset and bool(args.datasets):
+        logger.error("Use either --dataset or --datasets, not both.")
+        sys.exit(2)
+
+    datasets_keys = _parse_datasets_keys(args.datasets)
+
+    pipeline_root = Path(args.pipeline_data_dir)
+    curator_root = _resolved_embeddings_curator_root(args.embeddings_curator_dir)
+
+    if args.list:
+        rows = _list_datasets_dir_snapshot(pipeline_root, curator_root, None)
+        if args.list_format == "json":
+            payload = [
+                {
+                    "key": r["key"],
+                    "in_config": r["in_config"],
+                    "status": r["status"],
+                    "rows": r["total_rows"],
+                    "shards": len(r["input_files"]),
+                    "hf_name": r["hf_name"],
+                    "preprocessed": str(r["preprocessed_dir"]),
+                    "embeddings_out": str(r["output_dir"]),
+                }
+                for r in rows
+            ]
+            print(json.dumps(payload, indent=2))
+        elif args.list_format == "tsv":
+            print("key\tin_config\tstatus\trows\tshards\thf_name\tpreprocessed\tembeddings_out")
+            for r in rows:
+                print(
+                    f"{r['key']}\t{r['in_config']}\t{r['status']}\t{r['total_rows']}\t"
+                    f"{len(r['input_files'])}\t{r['hf_name']}\t{r['preprocessed_dir']}\t{r['output_dir']}"
+                )
+        else:
+            wk = max((len(r["key"]) for r in rows), default=0)
+            wk = min(wk, 48)
+            print(
+                f"{'key':<{wk}}  {'cfg':>3}  {'status':<20}  {'rows':>12}  {'sh':>4}  embeddings_out"
+            )
+            print("-" * (wk + 3 + 20 + 12 + 4 + 45))
+            for r in rows:
+                k = r["key"] if len(r["key"]) <= wk else r["key"][: wk - 3] + "..."
+                cfg = "yes" if r["in_config"] else "no"
+                out_s = str(r["output_dir"])
+                if len(out_s) > 56:
+                    out_s = "..." + out_s[-53:]
+                print(
+                    f"{k:<{wk}}  {cfg:>3}  {r['status']:<20}  {r['total_rows']:12,}  "
+                    f"{len(r['input_files']):4d}  {out_s}"
+                )
+        n_ready = sum(1 for r in rows if r["status"] in ("ready", "disk_only_ready"))
+        n_wait = sum(1 for r in rows if r["status"] == "missing_preprocessed")
+        print(
+            f"\nTotal: {len(rows)} name(s) — {n_ready} embed-ready, {n_wait} missing preprocessed",
+            file=sys.stderr,
+        )
+        print(f"pipeline_data_dir: {pipeline_root}", file=sys.stderr)
+        sys.exit(0)
 
     logger.info("NeMo Curator — embedding extraction")
     logger.info("  model            : {}", _CFG.model_id)
     logger.info("  pipeline_data_dir: {}", args.pipeline_data_dir)
-    logger.info("  datasets         : {}", keys)
+    if curator_root is not None:
+        logger.info("  embeddings_curator_dir: {} (output)", curator_root)
+    else:
+        logger.info("  embeddings_curator_dir: (unset — output under each dataset dir)")
 
-    work_items = []
-    for key in keys:
-        if key not in _CFG.datasets:
-            logger.warning("Unknown dataset '{}' — skip", key)
-            continue
-        pre = _preprocessed_dir(args.pipeline_data_dir, key)
-        out = _embedding_dir(args.pipeline_data_dir, key)
-        inputs = _list_parquet_shards(pre)
-        if not inputs:
-            logger.warning("No preprocessed parquet in {} — run 00_datasets_downloader.py", pre)
-            continue
+    name_filter = None if datasets_keys is not None else args.dataset
+    work_items = _collect_embedding_candidates(pipeline_root, curator_root, name_filter)
+    if datasets_keys is not None:
+        work_items = _apply_datasets_key_filter(work_items, datasets_keys, pipeline_root)
+        if not work_items:
+            sys.exit(1)
+
+    logger.info("  datasets         : {}", [w["key"] for w in work_items])
+    disk_only = [w["key"] for w in work_items if not w.get("in_config", True)]
+    if disk_only:
+        logger.info("  disk-only (no config.yaml entry): {}", disk_only)
+
+    for w in work_items:
         if args.file_limit:
-            inputs = inputs[: args.file_limit]
-        rows = sum(pq.ParquetFile(str(f)).metadata.num_rows for f in inputs)
-        work_items.append({"key": key, "input_files": inputs, "output_dir": out, "total_rows": rows})
-        logger.info("  {} : {} shards, {:,} rows → {}", key, len(inputs), rows, out)
+            w["input_files"] = w["input_files"][: args.file_limit]
+        w["total_rows"] = sum(
+            pq.ParquetFile(str(f)).metadata.num_rows for f in w["input_files"]
+        )
+        logger.info(
+            "  {} : {} shards, {:,} rows → {}",
+            w["key"],
+            len(w["input_files"]),
+            w["total_rows"],
+            w["output_dir"],
+        )
 
     if not work_items:
-        logger.warning("No work items.")
+        logger.warning("No work items (no preprocessed parquet for selected datasets).")
         sys.exit(0)
 
     if args.dry_run:

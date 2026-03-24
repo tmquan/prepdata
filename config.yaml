@@ -10,7 +10,13 @@
 # ─── Paths ───────────────────────────────────────────────────────────────────
 pipeline_data_dir: /raid/datasets
 
-# Subdirectory names under <pipeline_data_dir>/<dataset_key>/ (override if needed).
+# Central embedding parquet root (optional). When set, 02 writes and 04 reads:
+#   <embeddings_curator_dir>/<dataset_key>/part-*.parquet
+# When null or "", embeddings use <pipeline_data_dir>/<dataset_key>/<embedding>/ instead.
+embeddings_curator_dir: /raid/embeddings_curator
+
+# Subdirectory names under <pipeline_data_dir>/<dataset_key>/ (used when
+# embeddings_curator_dir is empty, and for raw/preprocessed/reduction paths).
 curator_layout:
   raw: raw
   preprocessed: preprocessed
@@ -19,7 +25,7 @@ curator_layout:
 
 # Migrating older trees:
 #   <dataset>/data/           → <dataset>/preprocessed/
-#   <embeddings_dir>/<dataset>/parquet  → <dataset>/embeddings/
+#   Standalone embedding store → embeddings_curator_dir/<dataset_key>/
 
 # ─── Model ───────────────────────────────────────────────────────────────────
 model_id:      nvidia/llama-embed-nemotron-8b
